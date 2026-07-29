@@ -8,11 +8,14 @@ import type {
   ModuleFederationExtraOptions,
 } from '../types';
 import { VirtualModuleManager } from '../utils';
-import type { FederatedTypesMeta } from '../utils/federated-remote-types';
 import {
   applyTypesMetaToManifest,
   maybeGenerateFederatedRemoteTypes,
 } from '../utils/federated-remote-types';
+import {
+  FEDERATION_BUILD_SESSION,
+  type FederationBuildSession,
+} from '../federation-build-session';
 import { createBabelTransformer } from './babel-transformer';
 import {
   isUsingMFBundleCommand,
@@ -30,19 +33,6 @@ import { createResolveRequest } from './resolver';
 import { createRewriteRequest } from './rewrite-request';
 import { getModuleFederationSerializer } from './serializer';
 import { validateOptions } from './validate-options';
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_CONFIG: ModuleFederationConfigNormalized;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_ORIGINAL_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_REMOTE_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_MANIFEST_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_DTS_ASSETS: FederatedTypesMeta | undefined;
-}
 
 export function withModuleFederation(
   config: ConfigT,
@@ -93,13 +83,14 @@ function augmentConfig(
   const vmManager = new VirtualModuleManager(config);
 
   // original host entrypoint, usually <projectRoot>/index.js
-  const { originalEntryFilename, originalEntryPath } = getOriginalEntry(
+  const originalEntryFilename = 'index.js';
+  const originalEntryPath = path.resolve(
     config.projectRoot,
-    'index.js',
+    originalEntryFilename,
   );
 
   // virtual host entrypoint
-  const hostEntryFilename = originalEntryFilename;
+  const hostEntryFilename = 'host-entry.js';
   const hostEntryPath = path.resolve(tmpDirPath, hostEntryFilename);
 
   // virtual remote entrypoint
@@ -137,12 +128,14 @@ function augmentConfig(
   stubHostEntry(hostEntryPath);
   stubRemoteEntry(remoteEntryPath);
 
-  // pass data to bundle-mf-remote command
-  global.__METRO_FEDERATION_CONFIG = options;
-  global.__METRO_FEDERATION_HOST_ENTRY_PATH = hostEntryPath;
-  global.__METRO_FEDERATION_REMOTE_ENTRY_PATH = remoteEntryPath;
-  global.__METRO_FEDERATION_MANIFEST_PATH = manifestPath;
-  global.__METRO_FEDERATION_DTS_ASSETS = undefined;
+  const session: FederationBuildSession = {
+    federationConfig: options,
+    originalEntryPath,
+    hostEntryPath,
+    remoteEntryPath,
+    manifestPath,
+    tmpDirPath,
+  };
 
   maybeGenerateRemoteTypesForStart({
     isRemote,
@@ -150,10 +143,12 @@ function augmentConfig(
     projectRoot: config.projectRoot,
     tmpDirPath,
     manifestPath,
+    session,
   });
 
-  return {
+  const augmentedConfig = {
     ...config,
+    [FEDERATION_BUILD_SESSION]: session,
     serializer: {
       ...config.serializer,
       customSerializer: getModuleFederationSerializer(
@@ -198,7 +193,7 @@ function augmentConfig(
         options,
         paths: {
           asyncRequire: asyncRequirePath,
-          originalEntry: originalEntryPath,
+          getOriginalEntry: () => session.originalEntryPath,
           hostEntry: hostEntryPath,
           initHost: initHostPath,
           remoteModuleRegistry: remoteModuleRegistryPath,
@@ -232,10 +227,12 @@ function augmentConfig(
         remoteEntryFilename,
         manifestPath,
         tmpDirPath,
-        getDtsAssetNames: () => global.__METRO_FEDERATION_DTS_ASSETS,
+        getDtsAssetNames: () => session.dtsAssets,
       }),
     },
   };
+
+  return augmentedConfig;
 }
 
 function maybeGenerateRemoteTypesForStart(opts: {
@@ -244,6 +241,7 @@ function maybeGenerateRemoteTypesForStart(opts: {
   projectRoot: string;
   tmpDirPath: string;
   manifestPath: string;
+  session: FederationBuildSession;
 }) {
   if (process.argv[2] !== 'start') {
     return;
@@ -265,7 +263,7 @@ function maybeGenerateRemoteTypesForStart(opts: {
         return;
       }
 
-      global.__METRO_FEDERATION_DTS_ASSETS = typesMeta;
+      opts.session.dtsAssets = typesMeta;
       const manifest = JSON.parse(
         await fs.readFile(opts.manifestPath, 'utf-8'),
       ) as Record<string, any>;
@@ -281,21 +279,4 @@ function maybeGenerateRemoteTypesForStart(opts: {
       );
     }
   })();
-}
-
-function getOriginalEntry(
-  projectRoot: string,
-  entryFilename: string,
-): {
-  originalEntryFilename: string;
-  originalEntryPath: string;
-} {
-  const originalEntryFilename = path.basename(
-    global.__METRO_FEDERATION_ORIGINAL_ENTRY_PATH ?? entryFilename,
-  );
-  const originalEntryPath = path.resolve(
-    projectRoot,
-    global.__METRO_FEDERATION_ORIGINAL_ENTRY_PATH ?? entryFilename,
-  );
-  return { originalEntryFilename, originalEntryPath };
 }

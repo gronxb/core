@@ -15,7 +15,7 @@ rs.mock('../../src/plugin/babel-transformer', () => ({
 }));
 
 import { toPosixPath } from '../../src/plugin/helpers';
-import { withModuleFederation } from '../../src/plugin';
+import { getFederationBuildSession, withModuleFederation } from '../../src';
 
 let projectCount = 0;
 
@@ -80,12 +80,46 @@ describe('withModuleFederation', () => {
 
   afterEach(() => {
     process.argv = originalArgv.slice();
-    delete (global as any).__METRO_FEDERATION_CONFIG;
-    delete (global as any).__METRO_FEDERATION_HOST_ENTRY_PATH;
-    delete (global as any).__METRO_FEDERATION_REMOTE_ENTRY_PATH;
-    delete (global as any).__METRO_FEDERATION_MANIFEST_PATH;
+    Reflect.deleteProperty(globalThis, '__METRO_FEDERATION_CONFIG');
+    Reflect.deleteProperty(globalThis, '__METRO_FEDERATION_HOST_ENTRY_PATH');
+    Reflect.deleteProperty(globalThis, '__METRO_FEDERATION_REMOTE_ENTRY_PATH');
+    Reflect.deleteProperty(globalThis, '__METRO_FEDERATION_MANIFEST_PATH');
     vol.reset();
     rs.restoreAllMocks();
+  });
+
+  it('owns federation build state on the returned Metro config', () => {
+    const projectRoot = createProjectRoot();
+    const metroConfig = createMetroConfig(projectRoot);
+    const sessionKey = Symbol.for(
+      '@module-federation/metro/FederationBuildSession',
+    );
+
+    const config = withModuleFederation(metroConfig, getValidConfig());
+    const session = Reflect.get(config, sessionKey);
+
+    expect(session).toMatchObject({
+      federationConfig: {
+        name: 'MetroHost',
+      },
+      originalEntryPath: path.join(projectRoot, 'index.js'),
+      hostEntryPath: path.join(
+        projectRoot,
+        'node_modules',
+        '.mf-metro',
+        'host-entry.js',
+      ),
+      manifestPath: path.join(
+        projectRoot,
+        'node_modules',
+        '.mf-metro',
+        'mf-manifest.json',
+      ),
+    });
+    expect(Object.prototype.propertyIsEnumerable.call(config, sessionKey)).toBe(
+      true,
+    );
+    expect('__METRO_FEDERATION_CONFIG' in globalThis).toBe(false);
   });
 
   it('uses runtimePlugins in normalized federation config', () => {
@@ -94,14 +128,13 @@ describe('withModuleFederation', () => {
     const runtimePluginPath = path.join(projectRoot, 'runtime-plugin.js');
     vol.writeFileSync(runtimePluginPath, 'module.exports = () => ({})');
 
-    withModuleFederation(metroConfig, {
+    const config = withModuleFederation(metroConfig, {
       ...getValidConfig(),
       runtimePlugins: [runtimePluginPath],
     } as any);
-
-    const normalized = (global as any).__METRO_FEDERATION_CONFIG;
-    const tmpDirPath = path.join(projectRoot, 'node_modules', '.mf');
-    expect(normalized.plugins).toContain(
+    const session = getFederationBuildSession(config);
+    const tmpDirPath = path.join(projectRoot, 'node_modules', '.mf-metro');
+    expect(session?.federationConfig.plugins).toContain(
       toPosixPath(path.relative(tmpDirPath, runtimePluginPath)),
     );
   });

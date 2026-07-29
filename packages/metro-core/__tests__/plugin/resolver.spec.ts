@@ -35,12 +35,16 @@ function createConfig(
   };
 }
 
-function createPaths(projectDir: string, tmpDir: string) {
+function createPaths(
+  projectDir: string,
+  tmpDir: string,
+  getOriginalEntry = () => path.join(projectDir, 'index.js'),
+) {
   return {
     asyncRequire: path.join(projectDir, 'asyncRequire.ts'),
-    hostEntry: path.join(tmpDir, 'index.js'),
+    getOriginalEntry,
+    hostEntry: path.join(tmpDir, 'host-entry.js'),
     initHost: path.join(tmpDir, 'init-host.js'),
-    originalEntry: path.join(projectDir, 'index.js'),
     remoteEntry: path.join(tmpDir, 'mini.js'),
     remoteHMRSetup: path.join(tmpDir, 'remote-hmr.js'),
     remoteModuleRegistry: path.join(tmpDir, 'remote-module-registry.js'),
@@ -131,6 +135,41 @@ function createBaseConfig(): ModuleFederationConfigNormalized {
 }
 
 describe('createResolveRequest', () => {
+  it('generates the host entry from the invocation-bound original entry', () => {
+    const projectDir = '/project';
+    const tmpDir = path.join(projectDir, 'node_modules', '.mf-metro');
+    const vmManager: Pick<VirtualModuleManager, 'registerVirtualModule'> = {
+      registerVirtualModule: rs.fn(),
+    };
+    const paths = createPaths(projectDir, tmpDir, () =>
+      path.join(projectDir, 'src', 'custom-entry.js'),
+    );
+    const resolveRequest = createResolveRequest({
+      isRemote: false,
+      hacks: {
+        patchHMRClient: false,
+        patchInitializeCore: false,
+      },
+      options: createBaseConfig(),
+      paths,
+      vmManager,
+    });
+    const fallbackResolver = rs.fn<CustomResolver>(() => ({
+      type: 'sourceFile',
+      filePath: '/fallback.js',
+    }));
+    const context = createResolverContext(
+      path.join(projectDir, 'src', 'App.tsx'),
+      fallbackResolver,
+    );
+
+    resolveRequest(context, './node_modules/.mf-metro/host-entry.js', 'ios');
+
+    const [[, registeredModule]] = rs.mocked(vmManager.registerVirtualModule)
+      .mock.calls;
+    expect(registeredModule()).toContain('src/custom-entry.js');
+  });
+
   it.each([
     {
       sharedName: 'networking',

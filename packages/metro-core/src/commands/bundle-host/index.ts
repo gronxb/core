@@ -1,69 +1,52 @@
 import path from 'node:path';
 import util from 'node:util';
-import type { ModuleFederationConfigNormalized } from '../../types';
 import { CLIError } from '../../utils/errors';
 import type { RequestOptions } from '../../utils/metro-compat';
 import { Server } from '../../utils/metro-compat';
+import { getFederationBuildSession } from '../../federation-build-session';
 import type { Config } from '../types';
 import { createResolver } from '../utils/create-resolver';
 import { getCommunityCliPlugin } from '../utils/get-community-plugin';
 import loadMetroConfig from '../utils/load-metro-config';
 import { saveBundleAndMap } from '../utils/save-bundle-and-map';
 import { toPosixPath } from '../../plugin/helpers';
+import type {
+  FederatedBundleCommand,
+  FederatedBundleContext,
+} from '../federated-bundle-command';
 import type { BundleFederatedHostArgs } from './types';
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_CONFIG: ModuleFederationConfigNormalized;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_ORIGINAL_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_HOST_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_REMOTE_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_MANIFEST_PATH: string | undefined;
-}
-
-async function bundleFederatedHost(
-  _argv: Array<string>,
-  cfg: Config,
-  args: BundleFederatedHostArgs,
-): Promise<void> {
+async function executeFederatedHost({
+  cfg,
+  args,
+  metroConfig: config,
+}: FederatedBundleContext<BundleFederatedHostArgs>): Promise<void> {
   const logger = cfg.logger ?? console;
-
-  // expose original entrypoint
-  // TODO: pass this without globals
-  global.__METRO_FEDERATION_ORIGINAL_ENTRY_PATH = args.entryFile;
-
-  const config = await loadMetroConfig(cfg, {
-    maxWorkers: args.maxWorkers,
-    resetCache: args.resetCache,
-    config: args.config,
-  });
-
-  // TODO: pass this without globals
-  const hostEntryFilepath = global.__METRO_FEDERATION_HOST_ENTRY_PATH;
-  if (!hostEntryFilepath) {
+  const session = getFederationBuildSession(config);
+  if (!session) {
     logger.error(
       `${util.styleText('red', 'error')} Cannot determine the host entrypoint path.`,
     );
     throw new CLIError('Bundling failed');
   }
 
-  // use virtual host entrypoint
-  args.entryFile = hostEntryFilepath;
+  session.originalEntryPath = path.resolve(config.projectRoot, args.entryFile);
+  const hostEntryFilepath = session.hostEntryPath;
+  const bundleArgs = {
+    ...args,
+    entryFile: hostEntryFilepath,
+  };
 
   const communityCliPlugin = getCommunityCliPlugin(cfg.reactNativePath);
 
   const buildBundleWithConfig =
     communityCliPlugin.unstable_buildBundleWithConfig;
 
-  return buildBundleWithConfig(args, config, {
+  return buildBundleWithConfig(bundleArgs, config, {
     build: async (server: Server, requestOpts: RequestOptions) => {
       // setup enhance middleware to trigger virtual modules setup
       config.server.enhanceMiddleware(server.processRequest, server);
-      const resolver = await createResolver(server, args.platform);
+      const resolver = await createResolver(server, bundleArgs.platform);
       // hack: resolve the host entry to register it as a virtual module
       const relativeHostEntryPath = toPosixPath(
         path.relative(config.projectRoot, hostEntryFilepath),
@@ -82,6 +65,24 @@ async function bundleFederatedHost(
     formatName: 'bundle',
   });
 }
+
+async function bundleFederatedHostCommand(
+  _argv: Array<string>,
+  cfg: Config,
+  args: BundleFederatedHostArgs,
+): Promise<void> {
+  const metroConfig = await loadMetroConfig(cfg, {
+    maxWorkers: args.maxWorkers,
+    resetCache: args.resetCache,
+    config: args.config,
+  });
+  return executeFederatedHost({ cfg, args, metroConfig });
+}
+
+const bundleFederatedHost: FederatedBundleCommand<BundleFederatedHostArgs> =
+  Object.assign(bundleFederatedHostCommand, {
+    executeWithConfig: executeFederatedHost,
+  });
 
 export default bundleFederatedHost;
 

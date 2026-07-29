@@ -32,9 +32,9 @@ interface CreateResolveRequestOptions {
   };
   paths: {
     asyncRequire: string;
+    getOriginalEntry: () => string;
     hostEntry: string;
     initHost: string;
-    originalEntry: string;
     remoteEntry: string;
     remoteHMRSetup: string;
     remoteModuleRegistry: string;
@@ -68,7 +68,7 @@ export function createResolveRequest({
     if (moduleName.match(hostEntryPathRegex)) {
       const hostEntryGenerator = () =>
         getHostEntryModule(options, {
-          originalEntry: paths.originalEntry,
+          originalEntry: paths.getOriginalEntry(),
           tmpDir: paths.tmpDir,
         });
       vmManager.registerVirtualModule(paths.hostEntry, hostEntryGenerator);

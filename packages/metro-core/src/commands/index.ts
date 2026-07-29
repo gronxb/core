@@ -23,3 +23,7 @@ export default {
 export type { BundleFederatedHostArgs } from './bundle-host/types';
 export type { BundleFederatedRemoteArgs } from './bundle-remote/types';
 export type { Config } from './types';
+export type {
+  FederatedBundleCommand,
+  FederatedBundleContext,
+} from './federated-bundle-command';

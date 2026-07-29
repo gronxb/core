@@ -2,56 +2,35 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import util from 'node:util';
 import { mergeConfig } from 'metro';
-import type { ModuleFederationConfigNormalized } from '../../types';
+import { getFederationBuildSession } from '../../federation-build-session';
 import { CLIError } from '../../utils/errors';
 import {
   applyTypesMetaToManifest,
   maybeGenerateFederatedRemoteTypes,
 } from '../../utils/federated-remote-types';
-import type { OutputOptions, RequestOptions } from '../../utils/metro-compat';
 import { Server } from '../../utils/metro-compat';
 import type { Config } from '../types';
 import { createModulePathRemapper } from '../utils/create-module-path-remapper';
 import { createResolver } from '../utils/create-resolver';
 import loadMetroConfig from '../utils/load-metro-config';
-import {
-  normalizeOutputRelativePath,
-  toFileSourceUrl,
-} from '../utils/path-utils';
 import { saveBundleAndMap } from '../utils/save-bundle-and-map';
-import { toPosixPath } from '../../plugin/helpers';
+import type {
+  FederatedBundleCommand,
+  FederatedBundleContext,
+} from '../federated-bundle-command';
 
+import {
+  createRemoteBundleRequests,
+  type RemoteBundleRequest,
+} from './create-bundle-requests';
 import type { BundleFederatedRemoteArgs } from './types';
 
 const DEFAULT_OUTPUT = 'dist';
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_CONFIG: ModuleFederationConfigNormalized;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_ORIGINAL_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_REMOTE_ENTRY_PATH: string | undefined;
-  // eslint-disable-next-line no-var
-  var __METRO_FEDERATION_MANIFEST_PATH: string | undefined;
-}
-
-interface ModuleDescriptor {
-  [moduleName: string]: {
-    isContainerModule?: boolean;
-    moduleInputFilepath: string;
-    moduleOutputDir: string;
-  };
-}
-
-interface BundleRequestOptions extends RequestOptions {
-  lazy: boolean;
-  modulesOnly: boolean;
-  runModule: boolean;
-  sourceUrl: string;
-}
-
-async function buildBundle(server: Server, requestOpts: BundleRequestOptions) {
+async function buildBundle(
+  server: Server,
+  requestOpts: RemoteBundleRequest['requestOpts'],
+) {
   const bundle = await server.build({
     ...Server.DEFAULT_BUNDLE_OPTIONS,
     ...requestOpts,
@@ -60,66 +39,14 @@ async function buildBundle(server: Server, requestOpts: BundleRequestOptions) {
   return bundle;
 }
 
-function getRequestOpts(
-  args: BundleFederatedRemoteArgs,
-  opts: {
-    isContainerModule: boolean;
-    entryFile: string;
-    sourceUrl: string;
-    sourceMapUrl: string;
-  },
-): BundleRequestOptions {
-  return {
-    dev: args.dev,
-    minify: args.minify !== undefined ? args.minify : !args.dev,
-    platform: args.platform,
-    entryFile: opts.entryFile,
-    sourceUrl: opts.sourceUrl,
-    sourceMapUrl: opts.sourceMapUrl,
-    // only use lazy for container bundles
-    lazy: opts.isContainerModule,
-    // only run module for container bundles
-    runModule: opts.isContainerModule,
-    // remove prelude for non-container modules
-    modulesOnly: !opts.isContainerModule,
-  };
-}
-
-function getSaveBundleOpts(
-  args: BundleFederatedRemoteArgs,
-  opts: {
-    bundleOutput: string;
-    sourcemapOutput: string;
-  },
-): OutputOptions {
-  return {
-    indexedRamBundle: false,
-    bundleEncoding: args.bundleEncoding,
-    dev: args.dev,
-    platform: args.platform,
-    sourcemapSourcesRoot: args.sourcemapSourcesRoot,
-    sourcemapUseAbsolutePath: args.sourcemapUseAbsolutePath,
-    bundleOutput: opts.bundleOutput,
-    sourcemapOutput: opts.sourcemapOutput,
-  };
-}
-
-async function bundleFederatedRemote(
-  _argv: Array<string>,
-  cfg: Config,
-  args: BundleFederatedRemoteArgs,
-): Promise<void> {
-  const rawConfig = await loadMetroConfig(cfg, {
-    maxWorkers: args.maxWorkers,
-    resetCache: args.resetCache,
-    config: args.config,
-  });
-
+async function executeFederatedRemote({
+  cfg,
+  args,
+  metroConfig: rawConfig,
+}: FederatedBundleContext<BundleFederatedRemoteArgs>): Promise<void> {
   const logger = cfg.logger ?? console;
-
-  // TODO: pass this without globals
-  const federationConfig = global.__METRO_FEDERATION_CONFIG;
-  if (!federationConfig) {
+  const session = getFederationBuildSession(rawConfig);
+  if (!session) {
     logger.error(
       `${util.styleText('red', 'error')} Module Federation configuration is missing.`,
     );
@@ -130,28 +57,11 @@ async function bundleFederatedRemote(
     );
     throw new CLIError('Bundling failed');
   }
-
-  // TODO: pass this without globals
-  const containerEntryFilepath = global.__METRO_FEDERATION_REMOTE_ENTRY_PATH;
-  if (!containerEntryFilepath) {
-    logger.error(
-      `${util.styleText('red', 'error')} Cannot determine the container entry file path.`,
-    );
-    logger.info(
-      'To bundle a container, you need to expose at least one module ' +
-        'in your Module Federation configuration.',
-    );
-    throw new CLIError('Bundling failed');
-  }
-
-  // TODO: pass this without globals
-  const manifestFilepath = global.__METRO_FEDERATION_MANIFEST_PATH;
-  if (!manifestFilepath) {
-    logger.error(
-      `${util.styleText('red', 'error')} Cannot determine the manifest file path.`,
-    );
-    throw new CLIError('Bundling failed');
-  }
+  const {
+    federationConfig,
+    remoteEntryPath: containerEntryFilepath,
+    manifestPath: manifestFilepath,
+  } = session;
 
   if (rawConfig.resolver.platforms.indexOf(args.platform) === -1) {
     logger.error(
@@ -217,111 +127,15 @@ async function bundleFederatedRemote(
         path.join(DEFAULT_OUTPUT, args.platform),
       );
 
-  const containerModule: ModuleDescriptor = {
-    [federationConfig.filename]: {
-      moduleInputFilepath: containerEntryFilepath,
-      moduleOutputDir: outputDir,
-      isContainerModule: true,
-    },
-  };
-
-  // hack: resolve the container entry to register it as a virtual module
-  const relativeContainerEntryPath = toPosixPath(
-    path.relative(config.projectRoot, containerEntryFilepath),
-  );
-  resolver.resolve({
-    from: config.projectRoot,
-    to: `./${relativeContainerEntryPath}`,
+  const requests = createRemoteBundleRequests({
+    args,
+    containerEntryFilepath,
+    federationConfig,
+    modulePathRemapper,
+    outputDir,
+    projectRoot: config.projectRoot,
+    resolver,
   });
-
-  const exposedModules = Object.entries(federationConfig.exposes)
-    .map(([moduleName, moduleFilepath]) => [
-      moduleName.slice(2),
-      moduleFilepath,
-    ])
-    .reduce((acc, [moduleName, moduleInputFilepath]) => {
-      acc[moduleName] = {
-        moduleInputFilepath: path.resolve(
-          config.projectRoot,
-          moduleInputFilepath,
-        ),
-        moduleOutputDir: path.resolve(outputDir, 'exposed'),
-        isContainerModule: false,
-      };
-      return acc;
-    }, {} as ModuleDescriptor);
-
-  const sharedModules = Object.entries(federationConfig.shared)
-    .filter(([, sharedConfig]) => {
-      return !sharedConfig.eager && sharedConfig.import !== false;
-    })
-    .reduce((acc, [moduleName]) => {
-      const inputFilepath = resolver.resolve({
-        from: containerEntryFilepath,
-        to: moduleName,
-      });
-      acc[moduleName] = {
-        moduleInputFilepath: inputFilepath,
-        moduleOutputDir: path.resolve(outputDir, 'shared'),
-        isContainerModule: false,
-      };
-      return acc;
-    }, {} as ModuleDescriptor);
-
-  const requests = Object.entries({
-    ...containerModule,
-    ...exposedModules,
-    ...sharedModules,
-  }).map(
-    ([
-      moduleName,
-      { moduleInputFilepath, moduleOutputDir, isContainerModule = false },
-    ]) => {
-      const moduleBundleName = isContainerModule
-        ? moduleName
-        : `${moduleName}.bundle`;
-      const moduleBundleFilepath = path.resolve(
-        moduleOutputDir,
-        moduleBundleName,
-      );
-      const relativeModuleBundlePath = normalizeOutputRelativePath(
-        path.relative(outputDir, moduleBundleFilepath),
-      );
-      // Metro requires `sourceURL` to be defined when doing bundle splitting
-      // we use relative path and supply it in fileURL format to avoid issues
-      const moduleBundleUrl = toFileSourceUrl(relativeModuleBundlePath);
-      const moduleSourceMapName = `${moduleBundleName}.map`;
-      const moduleSourceMapFilepath = path.resolve(
-        moduleOutputDir,
-        moduleSourceMapName,
-      );
-      // use relative path just like when bundling `index.bundle`
-      const moduleSourceMapUrl = normalizeOutputRelativePath(
-        path.relative(outputDir, moduleSourceMapFilepath),
-      );
-
-      if (!isContainerModule) {
-        modulePathRemapper.addMapping(
-          moduleInputFilepath,
-          relativeModuleBundlePath,
-        );
-      }
-
-      return {
-        targetDir: path.dirname(moduleBundleFilepath),
-        requestOpts: getRequestOpts(args, {
-          isContainerModule,
-          entryFile: moduleInputFilepath,
-          sourceUrl: moduleBundleUrl,
-          sourceMapUrl: moduleSourceMapUrl,
-        }),
-        saveBundleOpts: getSaveBundleOpts(args, {
-          bundleOutput: moduleBundleFilepath,
-          sourcemapOutput: moduleSourceMapFilepath,
-        }),
-      };
-    },
-  );
 
   try {
     logger.info(
@@ -379,6 +193,24 @@ async function bundleFederatedRemote(
     await server.end();
   }
 }
+
+async function bundleFederatedRemoteCommand(
+  _argv: Array<string>,
+  cfg: Config,
+  args: BundleFederatedRemoteArgs,
+): Promise<void> {
+  const metroConfig = await loadMetroConfig(cfg, {
+    maxWorkers: args.maxWorkers,
+    resetCache: args.resetCache,
+    config: args.config,
+  });
+  return executeFederatedRemote({ cfg, args, metroConfig });
+}
+
+const bundleFederatedRemote: FederatedBundleCommand<BundleFederatedRemoteArgs> =
+  Object.assign(bundleFederatedRemoteCommand, {
+    executeWithConfig: executeFederatedRemote,
+  });
 
 export default bundleFederatedRemote;
 
